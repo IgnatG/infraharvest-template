@@ -1,0 +1,199 @@
+name: template-test
+
+# Tests the template in IgnatG/infraharvest-template itself. Every job is
+# skipped in a repository made from the template (the if on each job), so
+# copies never run it and may delete this file.
+#
+# lint: actionlint, with shellcheck on each run block, over the workflows;
+# and import.yml and drift.yml must pin one commit of the infraharvest
+# Action and give it only inputs its action.yml at that commit has.
+#
+# e2e: builds infraharvest at that commit and runs the Action from it
+# against the Floci AWS emulator, as action-test in IgnatG/infraharvest
+# does: first with the inputs import.yml gives it on AWS, this repository's
+# infraharvest.yaml included, so a configuration infraharvest rejects
+# fails it; then, once the roots are applied, with drift.yml's inputs. It
+# doesn't test the cloud sign-ins, installing a release (version), the
+# GitHub App token or opening the pull requests.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    if: github.repository == 'IgnatG/infraharvest-template'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.pin.outputs.sha }}
+    steps:
+      - name: Check out the template
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Find the pinned infraharvest commit
+        id: pin
+        run: |
+          mapfile -t pins < <(grep -hoE 'IgnatG/infraharvest/action@[0-9a-f]{40}' .github/workflows/import.yml .github/workflows/drift.yml | sort -u)
+          if [[ ${#pins[@]} -ne 1 ]]; then
+            echo "::error::import.yml and drift.yml must pin one commit of IgnatG/infraharvest/action; found: ${pins[*]:-none}"
+            exit 1
+          fi
+          echo "sha=${pins[0]#*@}" >> "$GITHUB_OUTPUT"
+      # Into a subdirectory, so that actionlint checks the inputs this
+      # workflow gives ./infraharvest/action against its action.yml.
+      - name: Check out infraharvest at that commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: IgnatG/infraharvest
+          ref: ${{ steps.pin.outputs.sha }}
+          path: infraharvest
+          persist-credentials: false
+      # yq is mikefarah's, which the runner image has.
+      - name: Check the Action's inputs
+        run: |
+          known=$(yq '.inputs | keys | .[]' infraharvest/action/action.yml)
+          status=0
+          for workflow in .github/workflows/*.yml; do
+            while IFS= read -r input; do
+              [[ -z "$input" ]] && continue
+              if ! grep -qxF -- "$input" <<< "$known"; then
+                echo "::error file=$workflow::the infraharvest Action has no input '$input'"
+                status=1
+              fi
+            done < <(yq '.jobs[].steps[] | select((.uses // "") | test("^(IgnatG/infraharvest|[.]/infraharvest)/action(@|$)")) | (.with // {}) | keys | .[]' "$workflow")
+          done
+          exit "$status"
+      # Dependabot doesn't update this: bump the version and its checksum
+      # (actionlint_<version>_checksums.txt of the release) together.
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$archive"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
+          # actionlint skips the run blocks without shellcheck, which the
+          # runner image has.
+          command -v shellcheck
+      - name: Run actionlint
+        run: |
+          "$RUNNER_TEMP/actionlint" -color .github/workflows/*.yml
+
+  e2e:
+    needs: lint
+    if: github.repository == 'IgnatG/infraharvest-template'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AWS_ENDPOINT_URL: http://localhost:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: us-east-1
+      # As in infraharvest's own workflows: fetch a module the proxy drops
+      # from its repository instead. go.sum still checks it.
+      GOPROXY: https://proxy.golang.org|direct
+    steps:
+      - name: Check out the template
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out infraharvest at the pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: IgnatG/infraharvest
+          ref: ${{ needs.lint.outputs.sha }}
+          path: infraharvest
+          persist-credentials: false
+      - name: Free disk space
+        run: infraharvest/.github/scripts/free-disk-space.sh start
+      - name: Install Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: infraharvest/go.mod
+          cache-dependency-path: infraharvest/go.sum
+      - name: Wait for free disk space
+        run: infraharvest/.github/scripts/free-disk-space.sh wait
+      - name: Build infraharvest
+        working-directory: infraharvest
+        run: go build -tags minimal,aws -o "$RUNNER_TEMP/infraharvest" .
+      - name: Install Terraform
+        uses: ./infraharvest/.github/actions/setup-engines
+        with:
+          engine: terraform
+      - name: Start Floci and create a queue
+        run: |
+          docker compose -f infraharvest/e2e/compose.yaml up -d --wait
+          aws sqs create-queue --queue-name infraharvest-template
+      # import.yml's inputs on AWS, with SERVICES sqs and REGIONS us-east-1,
+      # and binary instead of version.
+      - name: Run the Action as import.yml does
+        id: import
+        uses: ./infraharvest/action
+        with:
+          binary: ${{ runner.temp }}/infraharvest
+          provider: aws
+          services: sqs
+          regions: us-east-1
+          config: infraharvest.yaml
+          incremental: "true"
+      # Exit code 0: every root passed the verification gate, a plan that
+      # imports the queue and changes nothing else among its checks.
+      - name: Check the import
+        env:
+          EXIT_CODE: ${{ steps.import.outputs.exit-code }}
+          REPORT: ${{ steps.import.outputs.report }}
+        run: |
+          test "$EXIT_CODE" = 0
+          test -f "$REPORT"
+          test -f infraharvest-out/.gitignore
+          grep -r --include=imports.tf "aws_sqs_queue" infraharvest-out
+      # The state goes outside the roots, as a backend keeps it. Once
+      # applied, each root must plan with no changes.
+      - name: Apply the roots and plan them again
+        run: |
+          mkdir -p "$RUNNER_TEMP/state"
+          n=0
+          while IFS= read -r file; do
+            root=$(dirname "$file")
+            n=$((n + 1))
+            printf 'terraform {\n  backend "local" {\n    path = "%s"\n  }\n}\n' "$RUNNER_TEMP/state/$n.tfstate" > "$root/backend.tf"
+            terraform -chdir="$root" init -input=false
+            terraform -chdir="$root" apply -input=false -auto-approve
+            terraform -chdir="$root" plan -input=false -detailed-exitcode
+          done < <(find infraharvest-out -name imports.tf -not -path '*/.terraform/*')
+          test "$n" -gt 0
+      # drift.yml's inputs, on the applied roots: nothing changed in the
+      # cloud since, so no drift.
+      - name: Run the Action as drift.yml does
+        id: drift
+        uses: ./infraharvest/action
+        with:
+          binary: ${{ runner.temp }}/infraharvest
+          import: "false"
+          drift: report
+      - name: Check the drift check
+        env:
+          DRIFT_EXIT_CODE: ${{ steps.drift.outputs.drift-exit-code }}
+          DRIFT_FOUND: ${{ steps.drift.outputs.drift-found }}
+          DRIFT_REPORT: ${{ steps.drift.outputs.drift-report }}
+        run: |
+          test "$DRIFT_EXIT_CODE" = 0
+          test "$DRIFT_FOUND" = false
+          test -f "$DRIFT_REPORT"
+      - name: Floci logs
+        if: failure()
+        run: docker compose -f infraharvest/e2e/compose.yaml logs

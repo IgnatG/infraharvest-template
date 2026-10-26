@@ -1,0 +1,46 @@
+# infraharvest configuration, which import.yml passes to the Action
+# (config: infraharvest.yaml). The provider, services and regions come
+# from the repository variables CLOUD, SERVICES and REGIONS; a flag the
+# workflow passes wins over the same setting here. Every key is described
+# at https://ignatg.github.io/infraharvest/configuration/
+version: 1
+
+# Where the generated roots keep their state. Set one before the first
+# import: each root then gets a backend.tf with a state key of its own,
+# <key_prefix>/<root path>/terraform.tfstate. Without a backend the roots
+# keep local state, which the output's .gitignore leaves out of the
+# repository, so the drift workflow has no state to check against.
+# Importing never reads the backend; drift, and an import with
+# managed-state, need read access to it (the drift permission templates).
+# If the storage doesn't exist yet, `infraharvest bootstrap --config
+# infraharvest.yaml` writes a root that creates it. Uncomment one:
+#
+# backend:
+#   s3:
+#     bucket: acme-terraform-state
+#     region: eu-west-2
+#     key_prefix: imported
+#
+# backend:
+#   azurerm:
+#     resource_group_name: terraform-state
+#     storage_account_name: acmeterraformstate
+#     container_name: tfstate
+#     key_prefix: imported
+#
+# backend:
+#   gcs:
+#     bucket: acme-terraform-state
+#     prefix: imported
+
+# Environments: each gets roots of its own, and the roots each stack has
+# in its environments merge into one root they share, with what differs
+# in vars/<env>/. The drift workflow then needs a job per environment
+# (see README.md). Name each environment's accounts (AWS), subscriptions
+# (Azure) or projects (Google Cloud), or the tags that tell them apart:
+#
+# environments:
+#   dev:
+#     aws: { accounts: ["111111111111"] }
+#   prod:
+#     aws: { accounts: ["222222222222"] }

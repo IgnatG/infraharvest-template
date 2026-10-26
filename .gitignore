@@ -1,0 +1,27 @@
+# What stays out of version control outside the output directory.
+# infraharvest writes its own .gitignore into the output directory
+# (infraharvest-out/.gitignore) on the first import, for the roots' local
+# state, plans, .terraform/, .tfvars files and its .infraharvest/
+# checkpoints; a merged root's .gitignore then keeps vars/**/*.tfvars in.
+# Nothing here ignores what that file keeps in version control.
+
+# Terraform, for roots or tools you run outside the output directory.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# What infraharvest discover saves before the first import has written the
+# output's .gitignore: every listed resource's attributes, as sensitive as
+# state.
+.infraharvest/
+
+# The credentials file google-github-actions/auth writes into the
+# workspace.
+gha-creds-*.json

@@ -1,0 +1,143 @@
+name: import
+
+# Imports the cloud the repository variables name (see README.md) into
+# Terraform with infraharvest's GitHub Action, every Monday and on demand.
+# It opens or updates a pull request on infraharvest/import with the
+# generated configuration in infraharvest-out/, with the import report as
+# its body. Run again, it adds only what is new to the roots the
+# repository already has (incremental). It reads the cloud and writes
+# files; it never applies anything.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write       # push the pull request branch
+  pull-requests: write  # open the pull request
+  id-token: write       # OIDC to the cloud
+
+# The same group as drift.yml and the workflow that applies the roots:
+# drift, and an import with managed-state, read the state without locking
+# it, so they shouldn't run while an apply writes it.
+concurrency:
+  group: terraform-apply
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check the repository variables
+        env:
+          VERSION: ${{ vars.INFRAHARVEST_VERSION }}
+          CLOUD: ${{ vars.CLOUD }}
+          SERVICES: ${{ vars.SERVICES }}
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+        run: |
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+          if [[ -z "$VERSION" ]]; then
+            fail "set the repository variable INFRAHARVEST_VERSION to an infraharvest release, such as v0.1.0"
+          fi
+          if [[ -z "$SERVICES" ]]; then
+            fail "set the repository variable SERVICES to the services to import, comma-separated"
+          fi
+          case "$CLOUD" in
+            aws)
+              [[ -n "$AWS_ROLE_ARN" ]] || fail "set the repository variable AWS_ROLE_ARN"
+              ;;
+            azure)
+              [[ -n "$AZURE_CLIENT_ID" && -n "$AZURE_TENANT_ID" && -n "$AZURE_SUBSCRIPTION_ID" ]] ||
+                fail "set the repository variables AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID"
+              ;;
+            google)
+              [[ -n "$GCP_WORKLOAD_IDENTITY_PROVIDER" && -n "$GCP_SERVICE_ACCOUNT" && -n "$GCP_PROJECT" ]] ||
+                fail "set the repository variables GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT and GCP_PROJECT"
+              ;;
+            *)
+              fail "set the repository variable CLOUD to aws, azure or google, not '$CLOUD'"
+              ;;
+          esac
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Sign in to AWS
+        if: vars.CLOUD == 'aws'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: infraharvest-import-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      # infraharvest, Terraform and the azurerm backend sign in with the
+      # job's GitHub ID token (id-token: write) through these variables,
+      # asking for a new token each time, so no Azure CLI login is needed.
+      # ARM_USE_AZUREAD reads an azurerm backend's state with that identity
+      # rather than the storage account's key.
+      - name: Sign in to Azure
+        if: vars.CLOUD == 'azure'
+        env:
+          CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          {
+            echo "ARM_USE_OIDC=true"
+            echo "ARM_CLIENT_ID=$CLIENT_ID"
+            echo "ARM_TENANT_ID=$TENANT_ID"
+            echo "ARM_SUBSCRIPTION_ID=$SUBSCRIPTION_ID"
+            echo "ARM_USE_AZUREAD=true"
+          } >> "$GITHUB_ENV"
+      - name: Sign in to Google Cloud
+        if: vars.CLOUD == 'google'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.GCP_PROJECT }}
+      # Optional: with a GitHub App, checks run on the pull request, which
+      # they don't on one github.token opens (see README.md). The token
+      # lasts an hour, so an import that runs longer can't push with it.
+      - name: Create a GitHub App token
+        id: app-token
+        if: vars.INFRAHARVEST_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.INFRAHARVEST_APP_CLIENT_ID }}
+          private-key: ${{ secrets.INFRAHARVEST_APP_PRIVATE_KEY }}
+      # Bump to a release tag's commit once IgnatG/infraharvest has one.
+      - name: Import
+        id: infraharvest
+        uses: IgnatG/infraharvest/action@c9bd0baf26b20f018f3f37bf1046376e623cfff8 # main
+        with:
+          version: ${{ vars.INFRAHARVEST_VERSION }}
+          # The provider commands are named as CLOUD's values: aws, azure
+          # and google.
+          provider: ${{ vars.CLOUD }}
+          services: ${{ vars.SERVICES }}
+          # Azure takes no regions: it imports the subscription
+          # ARM_SUBSCRIPTION_ID names.
+          regions: ${{ vars.CLOUD != 'azure' && vars.REGIONS || '' }}
+          config: infraharvest.yaml
+          incremental: "true"
+          # Empty until the roots are applied and their imports.tf deleted;
+          # then backend (see README.md).
+          managed-state: ${{ vars.MANAGED_STATE }}
+          # Google Cloud names no project by default.
+          args: ${{ vars.CLOUD == 'google' && format('--projects={0}', vars.GCP_PROJECT) || '' }}
+          pull-request: "true"
+          pull-request-token: ${{ steps.app-token.outputs.token || github.token }}
