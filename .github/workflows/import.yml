@@ -122,7 +122,7 @@ jobs:
       # Bump to a release tag's commit once IgnatG/infraharvest has one.
       - name: Import
         id: infraharvest
-        uses: IgnatG/infraharvest/action@4d90c2e95db23c492570f0f7b71d5b6f2e8ea6f7 # main
+        uses: IgnatG/infraharvest/action@c9bd0baf26b20f018f3f37bf1046376e623cfff8 # main
         with:
           version: ${{ vars.INFRAHARVEST_VERSION }}
           # The provider commands are named as CLOUD's values: aws, azure
