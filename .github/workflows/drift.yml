@@ -1,0 +1,138 @@
+name: drift
+
+# Checks the roots in infraharvest-out/ for what changed in the cloud since
+# they were applied (infraharvest drift), every day and on demand. It
+# imports nothing. With drift: report it changes no code: it writes each
+# change into the decisions file, infraharvest-out/drift.yaml, for you to
+# decide, and opens or updates a pull request on infraharvest/drift with
+# that file and the drift report as its body. Until the roots exist, there
+# is nothing to check and the check is skipped. Drift reads the roots'
+# state, so it needs a backend in infraharvest.yaml and the drift role (see
+# README.md). With environments in infraharvest.yaml, run a job per
+# environment instead (see README.md).
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write       # push the pull request branch
+  pull-requests: write  # open the pull request
+  id-token: write       # OIDC to the cloud
+
+# The same group as import.yml and the workflow that applies the roots:
+# drift doesn't lock the state, so it shouldn't read it while an apply
+# writes it.
+concurrency:
+  group: terraform-apply
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check the repository variables
+        env:
+          VERSION: ${{ vars.INFRAHARVEST_VERSION }}
+          CLOUD: ${{ vars.CLOUD }}
+          AWS_ROLE_ARN: ${{ vars.AWS_DRIFT_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+        run: |
+          fail() {
+            echo "::error::$1"
+            exit 1
+          }
+          if [[ -z "$VERSION" ]]; then
+            fail "set the repository variable INFRAHARVEST_VERSION to an infraharvest release, such as v0.1.0"
+          fi
+          case "$CLOUD" in
+            aws)
+              [[ -n "$AWS_ROLE_ARN" ]] || fail "set the repository variable AWS_DRIFT_ROLE_ARN"
+              ;;
+            azure)
+              [[ -n "$AZURE_CLIENT_ID" && -n "$AZURE_TENANT_ID" && -n "$AZURE_SUBSCRIPTION_ID" ]] ||
+                fail "set the repository variables AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID"
+              ;;
+            google)
+              [[ -n "$GCP_WORKLOAD_IDENTITY_PROVIDER" && -n "$GCP_SERVICE_ACCOUNT" && -n "$GCP_PROJECT" ]] ||
+                fail "set the repository variables GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT and GCP_PROJECT"
+              ;;
+            *)
+              fail "set the repository variable CLOUD to aws, azure or google, not '$CLOUD'"
+              ;;
+          esac
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The drift role: read-only access and read access to the state. Its
+      # session must last the whole job, as drift signs in again after the
+      # refresh.
+      - name: Sign in to AWS
+        if: vars.CLOUD == 'aws'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DRIFT_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          role-session-name: infraharvest-drift-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      # As in import.yml: OIDC through the ARM_ variables, and the azurerm
+      # backend's state read with that identity (Storage Blob Data Reader).
+      - name: Sign in to Azure
+        if: vars.CLOUD == 'azure'
+        env:
+          CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          {
+            echo "ARM_USE_OIDC=true"
+            echo "ARM_CLIENT_ID=$CLIENT_ID"
+            echo "ARM_TENANT_ID=$TENANT_ID"
+            echo "ARM_SUBSCRIPTION_ID=$SUBSCRIPTION_ID"
+            echo "ARM_USE_AZUREAD=true"
+          } >> "$GITHUB_ENV"
+      - name: Sign in to Google Cloud
+        if: vars.CLOUD == 'google'
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ vars.GCP_PROJECT }}
+      - name: Create a GitHub App token
+        id: app-token
+        if: vars.INFRAHARVEST_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.INFRAHARVEST_APP_CLIENT_ID }}
+          private-key: ${{ secrets.INFRAHARVEST_APP_PRIVATE_KEY }}
+      # Bump to a release tag's commit once IgnatG/infraharvest has one,
+      # with import.yml.
+      - name: Check drift
+        id: infraharvest
+        uses: IgnatG/infraharvest/action@4d90c2e95db23c492570f0f7b71d5b6f2e8ea6f7 # main
+        with:
+          version: ${{ vars.INFRAHARVEST_VERSION }}
+          import: "false"
+          drift: report
+          # To have the pull request write the cloud's values of the
+          # changes you accept into the code instead, set drift to accept,
+          # with the decisions file you reviewed, rules, or both. A rule
+          # line starting with keep keeps what it matches, and the last
+          # rule that matches a change decides:
+          # drift: accept
+          # drift-decisions: infraharvest-out/drift.yaml
+          # drift-accept: |
+          #   attribute=tags.*
+          #   keep type=aws_security_group
+          pull-request: "true"
+          pull-request-token: ${{ steps.app-token.outputs.token || github.token }}
