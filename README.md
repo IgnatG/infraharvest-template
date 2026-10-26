@@ -36,31 +36,21 @@ The workflows sign in with OIDC, using the job's GitHub ID token, so no cloud se
 
 Scheduled runs present the token of the default branch, whose subject is `repo:<owner>/<name>:ref:refs/heads/main`. Trust that subject, or the whole repository. If you trust only that subject, a run started by hand on another branch can't sign in.
 
-**AWS.** The account needs GitHub's OIDC identity provider (`https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`), created once per account. The trust policy in `permissions/aws` (and `permissions/aws-drift`) only lets IAM principals assume the role (`trusted_principal_arns`), so add a statement for this repository to `data "aws_iam_policy_document" "trust"` in your copy of the template's `main.tf`:
+**AWS.** `permissions/aws` (the import role, `infraharvest-readonly`) and `permissions/aws-drift` (the drift role, `infraharvest-drift`) trust GitHub Actions through OIDC when you give them this repository's subject. The account needs GitHub's OIDC identity provider once; `create_github_oidc_provider=true` creates it in the first configuration you apply, and the other looks it up:
 
-```hcl
-  statement {
-    sid     = "AllowGitHubActions"
-    actions = ["sts:AssumeRoleWithWebIdentity"]
+```sh
+cd permissions/aws
+terraform init
+terraform apply \
+  -var 'github_oidc_subjects=["repo:<owner>/<name>:ref:refs/heads/main"]' \
+  -var create_github_oidc_provider=true   # only if the account has no GitHub OIDC provider yet
 
-    principals {
-      type        = "Federated"
-      identifiers = ["arn:aws:iam::<account>:oidc-provider/token.actions.githubusercontent.com"]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:aud"
-      values   = ["sts.amazonaws.com"]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:<owner>/<name>:ref:refs/heads/main"]
-    }
-  }
+cd ../aws-drift
+terraform init
+terraform apply -var 'github_oidc_subjects=["repo:<owner>/<name>:ref:refs/heads/main"]'
 ```
 
-Apply `permissions/aws` for the import role (`infraharvest-readonly`) and `permissions/aws-drift` for the drift role (`infraharvest-drift`). Sessions last an hour by default. A drift run must keep valid credentials until it ends. If an import or drift run takes longer than an hour, raise `max_session_duration` on the role and add `role-duration-seconds` to the workflow's sign-in step.
+Each prints its `role_arn`: set them as `AWS_ROLE_ARN` and `AWS_DRIFT_ROLE_ARN` (step 4). Sessions last an hour by default. A drift run must keep valid credentials until it ends. If an import or drift run takes longer than an hour, raise `max_session_duration` on the role and add `role-duration-seconds` to the workflow's sign-in step.
 
 **Azure.** Create an app registration, or a user-assigned managed identity, with a federated credential for this repository:
 
